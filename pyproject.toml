@@ -1,0 +1,15 @@
+[project]
+name = "mini-vector-search"
+version = "0.1.0"
+description = "A small, persistent local vector search MCP server"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "mcp>=1.26,<2",
+    "numpy>=1.26,<3",
+    "onnxruntime>=1.20,<2",
+    "tokenizers>=0.21,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
