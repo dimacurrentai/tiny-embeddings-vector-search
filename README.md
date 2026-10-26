@@ -78,4 +78,14 @@ Logs go to stderr, leaving stdout for MCP.
 
 ```sh
 uv run python -m unittest discover -s tests -v
+RUN_MODEL_TESTS=1 uv run python -m unittest discover -s tests -v
 ```
+
+The default suite runs offline after dependency installation. It covers
+ranking, replacement, persistence, deletion, validation, download cleanup, cache
+reuse, checksum verification, and actual MCP subprocess discovery and calls.
+The second command also downloads and executes the real model, checks normalized
+embeddings and padding, and exercises semantic search through MCP.
+Tests reuse `.data/models/` and create
+scratch directories under gitignored `tmp/test-<random>/`, removing them afterward.
+Neither command modifies your document index.
