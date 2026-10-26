@@ -123,7 +123,30 @@ The default suite runs offline after dependency installation. It covers
 ranking, replacement, persistence, deletion, validation, download cleanup, cache
 reuse, checksum verification, and actual MCP subprocess discovery and calls.
 The second command also downloads and executes the real model, checks normalized
-embeddings and padding, and exercises semantic search through MCP.
+embeddings and padding, exercises semantic search through MCP, and runs the CLINC150 subset evaluation.
 Both stdio and localhost HTTP are covered. Tests reuse `.data/models/` and create
 scratch directories under gitignored `tmp/test-<random>/`, removing them afterward.
 Neither command modifies your document index.
+
+### Small, vendored quality evaluation
+
+[tests/fixtures/clinc150](tests/fixtures/clinc150) contains 200 human-labeled
+snippets from 20 intents, in readable JSON (~24 KB including IDs and field names).
+The original CC BY 3.0 license, full attribution, pinned upstream revision,
+source checksum, and deterministic reproduction script are included. No dataset
+download or extra dependency is needed to run it.
+
+Each snippet queries the other 199 through the real Store search path. Matching
+intent is the relevance label; the query itself is excluded. This measures
+intent retrieval on a fixed subset, not general embedding quality or the full
+CLINC150 benchmark. Selection was fixed before measuring performance.
+
+```sh
+RUN_MODEL_TESTS=1 uv run python -m unittest discover -s tests -p test_quality.py -v
+```
+
+Measured on macOS: top-1 accuracy **98%**, hit rate at 5 **100%**, recall at 5
+**51.28%**, MRR at 5 **0.9877**. Recall at 5 has a maximum of 5/9 (55.56%) because
+each query has nine relevant snippets. The regression floors, set before the
+first run, are 70% top-1 and 85% hit rate at 5. They are guards against regressions,
+not estimates for unseen queries.

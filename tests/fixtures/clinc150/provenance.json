@@ -1,0 +1,9 @@
+{
+  "source": "https://raw.githubusercontent.com/clinc/oos-eval/828f8093932c8fe6ca7936c3d2e52903b1c523de/data/data_full.json",
+  "revision": "828f8093932c8fe6ca7936c3d2e52903b1c523de",
+  "source_sha256": "36923c3705a59e08fe9c3883d8bc2dd966ef93e22cb78ac41171782a698d56e0",
+  "split": "test",
+  "selection": "First 20 lexicographically sorted intents; first 10 rows per intent in source order",
+  "changes": "Subset and JSON field conversion; original text and intent labels unchanged",
+  "license": "CC-BY-3.0"
+}
