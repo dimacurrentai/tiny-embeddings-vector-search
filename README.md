@@ -15,7 +15,7 @@ uv run mini-vector-search
 ```
 
 uv installs Python 3.12 and dependencies automatically. The process waits for
-an MCP client on stdin.
+an MCP client on stdin. An optional localhost HTTP transport is described below.
 Supported targets are macOS, Linux, and WSL. In WSL, install and run uv and
 the MCP client inside the Linux environment.
 
@@ -74,6 +74,44 @@ Search is an exact linear scan, suitable for small collections; all vectors
 are loaded into memory per query. Scores are similarities, not probabilities.
 Logs go to stderr, leaving stdout for MCP.
 
+## Share a localhost MCP server between agents
+
+```sh
+uv run mini-vector-search --transport streamable-http --port 8000
+```
+
+The endpoint is `http://127.0.0.1:8000/mcp`. It binds only to loopback and has
+no authentication; use it on your own machine. Stop it with Ctrl-C.
+
+Claude Code project `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "mini-vector-search": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}
+```
+
+Codex project `.codex/config.toml` (in a trusted project):
+
+```toml
+[mcp_servers.mini-vector-search]
+url = "http://127.0.0.1:8000/mcp"
+enabled_tools = ["search", "stats", "upsert_document", "delete_document"]
+
+[mcp_servers.mini-vector-search.tools.search]
+approval_mode = "approve"
+```
+
+The search override permits noninteractive queries; other tools retain the
+client's default approval behavior. See the official
+[Codex MCP configuration](https://developers.openai.com/codex/mcp) and
+[Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
+
 ## Tests
 
 ```sh
@@ -86,6 +124,6 @@ ranking, replacement, persistence, deletion, validation, download cleanup, cache
 reuse, checksum verification, and actual MCP subprocess discovery and calls.
 The second command also downloads and executes the real model, checks normalized
 embeddings and padding, and exercises semantic search through MCP.
-Tests reuse `.data/models/` and create
+Both stdio and localhost HTTP are covered. Tests reuse `.data/models/` and create
 scratch directories under gitignored `tmp/test-<random>/`, removing them afterward.
 Neither command modifies your document index.

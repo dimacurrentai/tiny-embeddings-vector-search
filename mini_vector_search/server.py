@@ -1,4 +1,4 @@
-"""Local MCP entry point; stdout belongs exclusively to MCP."""
+"""Local MCP entry point; stdout belongs exclusively to MCP in stdio mode."""
 
 import argparse
 import logging
@@ -13,9 +13,9 @@ from .store import Store
 DEFAULT_DATA = Path(__file__).resolve().parent.parent / ".data"
 
 
-def create_server(directory: Path = DEFAULT_DATA) -> FastMCP:
+def create_server(directory: Path = DEFAULT_DATA, port: int = 8000) -> FastMCP:
     store = Store(directory)
-    server = FastMCP("mini-vector-search")
+    server = FastMCP("mini-vector-search", host="127.0.0.1", port=port)
 
     @server.tool()
     def upsert_document(id: str, text: str) -> dict[str, Any]:
@@ -43,9 +43,13 @@ def create_server(directory: Path = DEFAULT_DATA) -> FastMCP:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA)
+    parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
+    parser.add_argument("--port", type=int, default=8000, help="Local HTTP port (0 selects a free port)")
     args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be between 0 and 65535")
     logging.basicConfig(level=logging.INFO)
-    create_server(args.data_dir.resolve()).run(transport="stdio")
+    create_server(args.data_dir.resolve(), port=args.port).run(transport=args.transport)
 
 
 if __name__ == "__main__":
