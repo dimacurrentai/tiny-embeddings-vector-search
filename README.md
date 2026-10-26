@@ -150,3 +150,33 @@ Measured on macOS: top-1 accuracy **98%**, hit rate at 5 **100%**, recall at 5
 each query has nine relevant snippets. The regression floors, set before the
 first run, are 70% top-1 and 85% hit rate at 5. They are guards against regressions,
 not estimates for unseen queries.
+
+### Real Claude Code and Codex MCP smoke tests
+
+These are two separate opt-in tests using installed, authenticated CLIs and their
+configured/default models. They make real model requests and use your accounts'
+quota. No credentials or global client configuration are changed. Tested with
+Claude Code 2.1.308 and Codex CLI 0.164.0; older CLIs may lack the flags used here.
+
+```sh
+# Both agent tests against one temporary localhost server:
+RUN_AGENT_TESTS=1 uv run python -m unittest discover -s tests -p test_agents.py -v
+
+# Run either separately:
+RUN_AGENT_TESTS=1 uv run python -m unittest discover -s tests -p test_agents.py -k claude -v
+RUN_AGENT_TESTS=1 uv run python -m unittest discover -s tests -p test_agents.py -k codex -v
+```
+
+Each agent runs in its own temporary Git repository under `tmp/test-<random>/`.
+The tests seed a temporary
+index with a fresh random verification marker and a distractor, start the real
+service on a free loopback port, and request exactly one MCP search. Assertions
+check the actual tool-call event and the retrieved marker and document ID in the
+answer. The marker is never included in the prompt. Claude allows the search tool;
+Codex exposes and preapproves only search for its invocation.
+
+Server processes and temporary repositories/indexes are cleaned up even on test
+failure. Agent JSON event transcripts and stderr remain in gitignored
+`tmp/agent-smoke-<random>/` for inspection; each run prints its directory and keeps
+its own transcripts. Agent tests
+are skipped in normal CI; HTTP protocol and model/quality tests run in CI.
