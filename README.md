@@ -6,6 +6,74 @@ no GPU, API key, PyTorch, Ollama daemon, or vector database is required.
 Four direct dependencies: `mcp`, `numpy`, `onnxruntime`, and `tokenizers`.
 SQLite and the test runner come with Python.
 
+## Run
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then from this checkout:
+
+```sh
+uv run mini-vector-search
+```
+
+uv installs Python 3.12 and dependencies automatically. The process waits for
+an MCP client on stdin.
+Supported targets are macOS, Linux, and WSL. In WSL, install and run uv and
+the MCP client inside the Linux environment.
+
+The first document insertion downloads the model (roughly 90 MB) from Hugging
+Face. Files are pinned to a model revision, verified against SHA-256 checksums,
+and stored in `.data/models/`.
+Documents and vectors persist in `.data/documents.sqlite3`. The entire `.data/`
+directory is gitignored. Downloads require internet; after caching, inference
+and search run offline. Failed downloads can be retried by repeating the tool call.
+Discovery, stats, deletion, and empty searches do not load the model.
+
+Paths default to this checkout, independent of the client's working directory.
+An optional `--data-dir /absolute/path` selects another index and model cache.
+Run from the checkout with uv; a standalone wheel installation instead places
+the default data beside the installed package and may require `--data-dir`.
+
+## Connect a local coding agent
+
+Add this entry to the agent's MCP server configuration, substituting the
+absolute checkout path (and the absolute uv executable path if necessary):
+
+```json
+{
+  "mcpServers": {
+    "mini-vector-search": {
+      "command": "uv",
+      "args": [
+        "run", "--directory", "/absolute/path/to/mini-vector-search",
+        "mini-vector-search"
+      ]
+    }
+  }
+}
+```
+
+The client's one-time server registration is the only required configuration.
+Use a generous first-call timeout (e.g. 180 seconds) for the initial download,
+or run the real-model test below first to populate the cache.
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `upsert_document` | `id`, `text` | Added/replaced ID |
+| `search` | `query`, optional `limit` (default 5; 1–100) | IDs, original text, cosine scores, highest first |
+| `delete_document` | `id` | Whether a document was deleted |
+| `stats` | none | Document count, model, revision, dimensions |
+
+Example: ask your agent to insert `{"id":"db-indexes","text":"Database indexes speed up SQL queries."}`
+with `upsert_document`, then call `search` with `{"query":"How can I make database lookups faster?"}`.
+
+Each insertion replaces the same ID atomically. Text is stored in full, but
+the model embeds only the first 256 tokens, so insert short passages as separate
+IDs. There is no automatic file scanning or chunking. The 384-dimensional
+embeddings use attention-mask-aware mean pooling and L2 normalization, as
+specified in the [model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2).
+Search is an exact linear scan, suitable for small collections; all vectors
+are loaded into memory per query. Scores are similarities, not probabilities.
+Logs go to stderr, leaving stdout for MCP.
+
 ## Tests
 
 ```sh

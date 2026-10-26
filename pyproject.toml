@@ -10,6 +10,9 @@ dependencies = [
     "tokenizers>=0.21,<1",
 ]
 
+[project.scripts]
+mini-vector-search = "mini_vector_search.server:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
