@@ -180,3 +180,41 @@ failure. Agent JSON event transcripts and stderr remain in gitignored
 `tmp/agent-smoke-<random>/` for inspection; each run prints its directory and keeps
 its own transcripts. Agent tests
 are skipped in normal CI; HTTP protocol and model/quality tests run in CI.
+
+### Pure C embedder comparison
+
+[bench/embed.c](bench/embed.c) computes the same embedding with no
+dependencies: a WordPiece tokenizer, the six BERT layers, mean pooling, and
+L2 normalization in about 400 lines of single-threaded float32 C. It exists to
+show what the model does and to measure ONNX Runtime against plain C.
+
+```sh
+uv run python bench/export_weights.py   # once: tensors and vocabulary from the cached ONNX model
+uv run python bench/compare.py          # builds bench/build/embed, checks agreement, times both
+```
+
+The exporter decodes the ONNX protobuf directly, so no extra package is needed.
+Both runners speak the same line protocol: one JSON string in, one line out with
+the token IDs and the final 384-dimensional vector. The comparison sends the 200
+CLINC150 snippets plus mixed-case, punctuated, and accented sentences through the
+C embedder, ONNX Runtime with default threads, and ONNX Runtime pinned to one
+thread, then times each after its first reply so model load is excluded.
+
+Measured on an Apple M3 Pro, best of 5 rounds, 12.9 tokens per sentence on average:
+
+| Runner | Per sentence | Sentences/s |
+| --- | --- | --- |
+| ONNX Runtime, default threads | 1.7 ms | 580 |
+| ONNX Runtime, one thread | 3.9 ms | 260 |
+| C, one thread | 5.9 ms | 170 |
+
+Token IDs are identical for every sentence, and vectors agree to within 3e-7,
+which is float32 rounding from different summation orders. ONNX Runtime wins
+with hand-tuned SIMD matrix kernels and threading; the C keeps the sums in
+model order and only unrolls the matrix loops. The C tokenizer matches the
+reference exactly for ASCII, Latin-1, and Latin Extended-A text; other scripts
+pass through to WordPiece without Unicode case folding.
+
+`RUN_MODEL_TESTS=1` also runs [tests/test_c_embedding.py](tests/test_c_embedding.py),
+which builds the C embedder and asserts identical token IDs and vectors within
+1e-5 on representative sentences, including truncation at 256 tokens.

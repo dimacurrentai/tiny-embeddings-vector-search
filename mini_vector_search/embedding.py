@@ -46,8 +46,9 @@ def download(directory: Path, name: str, sha256: str) -> Path:
 
 
 class Embedder:
-    def __init__(self, cache: Path):
+    def __init__(self, cache: Path, threads: int | None = None):
         self.cache = cache / REVISION
+        self.threads = threads
         self.session = None
 
     def encode(self, texts: list[str]) -> np.ndarray:
@@ -59,8 +60,12 @@ class Embedder:
             )
             tokenizer.enable_truncation(max_length=256)
             tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
+            options = ort.SessionOptions()
+            if self.threads:
+                options.intra_op_num_threads = self.threads
             session = ort.InferenceSession(
                 str(download(self.cache, "onnx/model.onnx", FILES["onnx/model.onnx"])),
+                options,
                 providers=["CPUExecutionProvider"],
             )
             self.tokenizer, self.session = tokenizer, session
