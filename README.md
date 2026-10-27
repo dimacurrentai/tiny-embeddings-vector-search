@@ -183,38 +183,63 @@ are skipped in normal CI; HTTP protocol and model/quality tests run in CI.
 
 ### Pure C embedder comparison
 
-[bench/embed.c](bench/embed.c) computes the same embedding with no
-dependencies: a WordPiece tokenizer, the six BERT layers, mean pooling, and
-L2 normalization in about 400 lines of single-threaded float32 C. It exists to
+[bench/embed.c](bench/embed.c) computes the same embedding with no dependencies
+beyond libc and pthreads: a WordPiece tokenizer, the six BERT layers, mean
+pooling, and L2 normalization in about 630 lines of float32 C. It exists to
 show what the model does and to measure ONNX Runtime against plain C.
 
 ```sh
 uv run python bench/export_weights.py   # once: tensors and vocabulary from the cached ONNX model
-uv run python bench/compare.py          # builds bench/build/embed, checks agreement, times both
+uv run python bench/compare.py          # builds bench/build/embed, checks agreement, times everything
 ```
 
 The exporter decodes the ONNX protobuf directly, so no extra package is needed.
 Both runners speak the same line protocol: one JSON string in, one line out with
 the token IDs and the final 384-dimensional vector. The comparison sends the 200
-CLINC150 snippets plus mixed-case, punctuated, and accented sentences through the
-C embedder, ONNX Runtime with default threads, and ONNX Runtime pinned to one
-thread, then times each after its first reply so model load is excluded.
+CLINC150 snippets plus mixed-case, punctuated, and accented sentences through
+each runner, then times each after its first reply so model load is excluded.
+`embed --time` additionally reports its own compute time per request on stderr.
 
-Measured on an Apple M3 Pro, best of 5 rounds, 12.9 tokens per sentence on average:
+Measured on an Apple M3 Pro (5 performance cores), best of 5 rounds, 12.9 tokens
+per sentence on average, through the pipe:
 
 | Runner | Per sentence | Sentences/s |
 | --- | --- | --- |
-| ONNX Runtime, default threads | 1.7 ms | 580 |
-| ONNX Runtime, one thread | 3.9 ms | 260 |
-| C, one thread | 5.9 ms | 170 |
+| C, 5 threads | 1.06 ms | 944 |
+| ONNX Runtime, default threads | 1.47 ms | 679 |
+| C, one thread | 3.5 ms | 284 |
+| ONNX Runtime, one thread | 3.8 ms | 262 |
 
 Token IDs are identical for every sentence, and vectors agree to within 3e-7,
-which is float32 rounding from different summation orders. ONNX Runtime wins
-with hand-tuned SIMD matrix kernels and threading; the C keeps the sums in
-model order and only unrolls the matrix loops. The C tokenizer matches the
-reference exactly for ASCII, Latin-1, and Latin Extended-A text; other scripts
-pass through to WordPiece without Unicode case folding.
+which is float32 rounding from different summation orders. The threaded C
+output is bit-identical to the single-threaded output, because threads only
+split column blocks and attention heads; every sum keeps its order.
+
+What it takes to match a tuned runtime, in order of effect:
+
+- **Register tiles.** Each matrix product is computed as 4-token by 16-output
+  tiles whose 64 accumulators stay in vector registers across the whole inner
+  dimension. Clang turns the plain loops into 16 fused multiply-adds per 6
+  loads; tiles of 2 and 1 tokens cover the remainder without padding.
+- **Packed weights.** The 90 MB of weights are streamed once per sentence and
+  dominate everything, so a single core's memory bandwidth (51 GB/s here, or
+  1.9 ms per 90 MB) is the floor. Reordering each weight matrix into tile order
+  at load time halved the time, because the original row-major layout used only
+  half of each cache line per pass.
+- **Threads.** `--threads N` splits column blocks and heads across a small pool
+  that spins during a request and sleeps between requests. Use the number of
+  performance cores; threads placed on efficiency cores slow the whole request.
+- **Vectorized GELU.** A branch-free erf with a vectorizable exp replaces the
+  scalar libm `erff`, which took 13% of single-thread time.
+
+ONNX Runtime pinned to one intra-op thread is genuinely single-threaded
+(CPU time equals wall time); its default setting here keeps about five cores
+busy for a 2.6x gain. The C tokenizer matches the reference exactly for ASCII,
+Latin-1, and Latin Extended-A text; other scripts pass through to WordPiece
+without Unicode case folding, and special-token names written in the input are
+ordinary text.
 
 `RUN_MODEL_TESTS=1` also runs [tests/test_c_embedding.py](tests/test_c_embedding.py),
-which builds the C embedder and asserts identical token IDs and vectors within
-1e-5 on representative sentences, including truncation at 256 tokens.
+which builds the C embedder and asserts identical token IDs, vectors within
+1e-5 of ONNX Runtime, bit-identical single- and multi-threaded output, and
+truncation at 256 tokens.

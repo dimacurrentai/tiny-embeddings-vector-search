@@ -1,7 +1,13 @@
 /* all-MiniLM-L6-v2 inference in plain C: WordPiece tokenizer, six BERT layers,
- * mean pooling, L2 normalization. Single-threaded, float32, no dependencies.
+ * mean pooling, L2 normalization. Float32, no dependencies beyond libc and
+ * pthreads.
  *
- *   embed <model-dir>/c
+ *   embed <model-dir>/c [--threads N] [--time]
+ *
+ * --threads splits every matrix product and the attention heads across N
+ * threads; one thread is the default. With --time, the microseconds spent
+ * tokenizing and embedding each request are written to stderr, excluding
+ * JSON parsing and output.
  *
  * Reads one JSON string per line from stdin and writes one JSON object per line:
  *   {"ids":[101,...,102],"vector":[0.0123,...]}
@@ -18,10 +24,16 @@
  */
 
 #include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 
 #define HIDDEN 384
 #define HEADS 12
@@ -46,6 +58,20 @@ static struct {
     const float *word, *position, *type, *ln_w, *ln_b;
     Layer layers[LAYERS];
 } model;
+
+#define TILE_OUT 16
+
+/* Reorders a [in][out] weight into [out / TILE_OUT][in][TILE_OUT] so each tile
+ * streams its sixteen columns contiguously instead of striding across rows. */
+static float *pack(float *w, uint32_t in, uint32_t out) {
+    float *packed = malloc((size_t)in * out * sizeof(float));
+    if (!packed) exit(1);
+    for (uint32_t j0 = 0; j0 < out; j0 += TILE_OUT)
+        for (uint32_t i = 0; i < in; i++)
+            memcpy(packed + ((size_t)j0 / TILE_OUT * in + i) * TILE_OUT, w + (size_t)i * out + j0, TILE_OUT * sizeof(float));
+    free(w);
+    return packed;
+}
 
 static void fail(const char *message) {
     fprintf(stderr, "embed: %s\n", message);
@@ -72,8 +98,12 @@ static void load_weights(const char *path) {
         name[length] = 0;
         uint32_t rank = read_u32(file), elements = 1;
         for (uint32_t d = 0; d < rank; d++) elements *= read_u32(file);
+        uint32_t dims[2] = {0, 0};
+        fseek(file, -(long)(rank * 4), SEEK_CUR);
+        for (uint32_t d = 0; d < rank; d++) dims[d < 2 ? d : 1] = read_u32(file);
         float *data = malloc(elements * sizeof(float));
         if (!data || fread(data, sizeof(float), elements, file) != elements) fail("truncated tensor");
+        if (rank == 2 && strstr(name, "encoder.layer.") && strstr(name, ".weight")) data = pack(data, dims[0], dims[1]);
 
         int layer;
         char role[96];
@@ -274,6 +304,78 @@ static int tokenize(const char *text, size_t length, int *ids) {
     return count;
 }
 
+/* ------------------------------------------------------------ thread pool */
+
+/* Workers spin on the job generation while a request is in flight and sleep
+ * on a condition variable between requests. The main thread takes share 0. */
+typedef void (*Job)(void *context, int begin, int end);
+
+static struct {
+    int threads;
+    pthread_mutex_t mutex;
+    pthread_cond_t wake;
+    _Atomic int generation, remaining, busy;
+    Job job;
+    void *context;
+    int count;
+} pool = {1, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0, NULL, NULL, 0};
+
+static void run_share(int index) {
+    int begin = (int)((long)pool.count * index / pool.threads);
+    int end = (int)((long)pool.count * (index + 1) / pool.threads);
+    if (begin < end) pool.job(pool.context, begin, end);
+}
+
+static void *worker(void *argument) {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+    int index = (int)(intptr_t)argument, seen = 0;
+    for (;;) {
+        while (atomic_load_explicit(&pool.generation, memory_order_acquire) == seen) {
+            if (!atomic_load(&pool.busy)) {
+                pthread_mutex_lock(&pool.mutex);
+                while (!atomic_load(&pool.busy) && atomic_load(&pool.generation) == seen)
+                    pthread_cond_wait(&pool.wake, &pool.mutex);
+                pthread_mutex_unlock(&pool.mutex);
+            }
+        }
+        seen++;
+        run_share(index);
+        atomic_fetch_sub_explicit(&pool.remaining, 1, memory_order_release);
+    }
+    return NULL;
+}
+
+static void start_pool(int threads) {
+    pool.threads = threads;
+    for (int index = 1; index < threads; index++) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, worker, (void *)(intptr_t)index) != 0) fail("cannot start thread");
+        pthread_detach(thread);
+    }
+}
+
+/* Runs job over [0, count) split evenly across the pool and waits for all shares. */
+static void parallel(int count, Job job, void *context) {
+    pool.job = job, pool.context = context, pool.count = count;
+    if (pool.threads == 1) { run_share(0); return; }
+    atomic_store(&pool.remaining, pool.threads - 1);
+    atomic_fetch_add_explicit(&pool.generation, 1, memory_order_release);
+    run_share(0);
+    while (atomic_load_explicit(&pool.remaining, memory_order_acquire) != 0) ;
+}
+
+static void request_begin(void) {
+    if (pool.threads == 1) return;
+    pthread_mutex_lock(&pool.mutex);
+    atomic_store(&pool.busy, 1);
+    pthread_cond_broadcast(&pool.wake);
+    pthread_mutex_unlock(&pool.mutex);
+}
+
+static void request_end(void) { atomic_store(&pool.busy, 0); }
+
 /* ------------------------------------------------------------ model */
 
 static void layer_norm(float *x, int tokens, const float *weight, const float *bias) {
@@ -287,42 +389,98 @@ static void layer_norm(float *x, int tokens, const float *weight, const float *b
     }
 }
 
-/* y[t] = x[t] @ W + b with W stored [in][out]. Eight weight rows are applied
- * per pass so each output element is loaded and stored once per eight
- * multiply-adds; the sums are still accumulated in row order, and the inner
- * loop runs along out, so it vectorizes without reassociating anything. */
-static void linear(const float *restrict x, int tokens, int in, const float *restrict w,
-                   const float *restrict b, int out, float *restrict y) {
-    for (int t = 0; t < tokens; t++) memcpy(y + t * out, b, out * sizeof(float));
-    for (int i = 0; i < in; i += 8) {
-        const float *w0 = w + i * out, *w1 = w0 + out, *w2 = w1 + out, *w3 = w2 + out;
-        const float *w4 = w3 + out, *w5 = w4 + out, *w6 = w5 + out, *w7 = w6 + out;
-        for (int t = 0; t < tokens; t++) {
-            const float *xi = x + t * in + i;
-            float x0 = xi[0], x1 = xi[1], x2 = xi[2], x3 = xi[3];
-            float x4 = xi[4], x5 = xi[5], x6 = xi[6], x7 = xi[7];
-            float *result = y + t * out;
-            for (int j = 0; j < out; j++) {
-                float r = result[j];
-                r += x0 * w0[j]; r += x1 * w1[j]; r += x2 * w2[j]; r += x3 * w3[j];
-                r += x4 * w4[j]; r += x5 * w5[j]; r += x6 * w6[j]; r += x7 * w7[j];
-                result[j] = r;
-            }
-        }
+/* y[t] = x[t] @ W + b with W packed [out / TILE_OUT][in][TILE_OUT], computed in
+ * tiles of up to four tokens by sixteen outputs whose accumulators stay in
+ * vector registers for the whole in loop. Each element still sums its products
+ * in row order, so results match a plain loop bit for bit. A column block is
+ * read from memory once and reused from cache for every token tile; tiles of
+ * 4, 2, and 1 tokens cover any token count without padding rows. */
+
+/* One ROWS x TILE_OUT tile: x points at the first token row, w at the packed
+ * column block, b and y at column j0. */
+#define DEFINE_TILE(NAME, ROWS) \
+static void NAME(const float *restrict x, int in, const float *restrict w, \
+                 const float *restrict b, int out, float *restrict y) { \
+    float acc[ROWS][TILE_OUT]; \
+    for (int r = 0; r < ROWS; r++) \
+        for (int j = 0; j < TILE_OUT; j++) acc[r][j] = b[j]; \
+    for (int i = 0; i < in; i++, w += TILE_OUT) { \
+        float s[ROWS]; \
+        for (int r = 0; r < ROWS; r++) s[r] = x[r * in + i]; \
+        for (int r = 0; r < ROWS; r++) \
+            for (int j = 0; j < TILE_OUT; j++) acc[r][j] += s[r] * w[j]; \
+    } \
+    for (int r = 0; r < ROWS; r++) memcpy(y + r * out, acc[r], sizeof acc[r]); \
+}
+
+DEFINE_TILE(tile4, 4)
+DEFINE_TILE(tile2, 2)
+DEFINE_TILE(tile1, 1)
+
+typedef struct { const float *x, *w, *b; float *y; int tokens, in, out; } Linear;
+
+static void linear_blocks(void *context, int begin, int end) {
+    const Linear *l = context;
+    for (int block = begin; block < end; block++) {
+        int j0 = block * TILE_OUT;
+        const float *w = l->w + (size_t)j0 * l->in, *b = l->b + j0;
+        float *y = l->y + j0;
+        int t = 0;
+        for (; t + 4 <= l->tokens; t += 4) tile4(l->x + t * l->in, l->in, w, b, l->out, y + t * l->out);
+        if (t + 2 <= l->tokens) { tile2(l->x + t * l->in, l->in, w, b, l->out, y + t * l->out); t += 2; }
+        if (t < l->tokens) tile1(l->x + t * l->in, l->in, w, b, l->out, y + t * l->out);
     }
 }
 
-static float gelu(float x) { return 0.5f * x * (1.0f + erff(x / 1.4142135f)); }
+static void linear(const float *x, int tokens, int in, const float *w, const float *b, int out, float *y) {
+    Linear l = {x, w, b, y, tokens, in, out};
+    parallel(out / TILE_OUT, linear_blocks, &l);
+}
+
+/* exp(x) for x <= 0, accurate to about one float ulp, written so the GELU loop
+ * vectorizes: 2^n is assembled from the exponent bits instead of calling ldexp. */
+static inline float exp_negative(float x) {
+    if (x < -87.0f) x = -87.0f;
+    float n = (float)(int)(x * 1.44269504f - 0.5f);
+    float r = x - n * 0.693145751953125f - n * 1.428606765330187e-06f;
+    float p = 1.9875691500e-4f;
+    p = p * r + 1.3981999507e-3f;
+    p = p * r + 8.3334519073e-3f;
+    p = p * r + 4.1665795894e-2f;
+    p = p * r + 1.6666665459e-1f;
+    p = p * r + 5.0000001201e-1f;
+    p = p * r * r + r + 1.0f;
+    int32_t bits = ((int32_t)n + 127) << 23;
+    float scale;
+    memcpy(&scale, &bits, sizeof scale);
+    return p * scale;
+}
+
+/* erf by the Abramowitz and Stegun 7.1.26 rational form, absolute error below
+ * 1.5e-7, branch-free so the GELU loop vectorizes. */
+static inline float erf_vector(float x) {
+    float sign = x < 0 ? -1.0f : 1.0f, a = fabsf(x);
+    float t = 1.0f / (1.0f + 0.3275911f * a);
+    float poly = ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t;
+    return sign * (1.0f - poly * exp_negative(-a * a));
+}
+
+static inline float gelu(float x) { return 0.5f * x * (1.0f + erf_vector(x * 0.70710678f)); }
+
+static void gelu_rows(void *context, int begin, int end) {
+    float *values = context;
+    for (int i = begin * INTERMEDIATE; i < end * INTERMEDIATE; i++) values[i] = gelu(values[i]);
+}
 
 static float q[MAX_TOKENS * HIDDEN], k[MAX_TOKENS * HIDDEN], v[MAX_TOKENS * HIDDEN];
 static float context[MAX_TOKENS * HIDDEN], scratch[MAX_TOKENS * HIDDEN], inter[MAX_TOKENS * INTERMEDIATE];
-static float scores[MAX_TOKENS];
 
-static void attention(float *x, int tokens, const Layer *l) {
-    linear(x, tokens, HIDDEN, l->wq, l->bq, HIDDEN, q);
-    linear(x, tokens, HIDDEN, l->wk, l->bk, HIDDEN, k);
-    linear(x, tokens, HIDDEN, l->wv, l->bv, HIDDEN, v);
-    for (int h = 0; h < HEADS; h++) {
+typedef struct { int tokens; } Heads;
+
+static void attention_heads(void *argument, int begin, int end) {
+    int tokens = ((Heads *)argument)->tokens;
+    float scores[MAX_TOKENS];
+    for (int h = begin; h < end; h++) {
         for (int i = 0; i < tokens; i++) {
             const float *qi = q + i * HIDDEN + h * HEAD_DIM;
             float max = -INFINITY;
@@ -344,6 +502,14 @@ static void attention(float *x, int tokens, const Layer *l) {
             }
         }
     }
+}
+
+static void attention(float *x, int tokens, const Layer *l) {
+    linear(x, tokens, HIDDEN, l->wq, l->bq, HIDDEN, q);
+    linear(x, tokens, HIDDEN, l->wk, l->bk, HIDDEN, k);
+    linear(x, tokens, HIDDEN, l->wv, l->bv, HIDDEN, v);
+    Heads heads = {tokens};
+    parallel(HEADS, attention_heads, &heads);
     linear(context, tokens, HIDDEN, l->wo, l->bo, HIDDEN, scratch);
     for (int i = 0; i < tokens * HIDDEN; i++) x[i] += scratch[i];
     layer_norm(x, tokens, l->ln1_w, l->ln1_b);
@@ -351,7 +517,7 @@ static void attention(float *x, int tokens, const Layer *l) {
 
 static void feed_forward(float *x, int tokens, const Layer *l) {
     linear(x, tokens, HIDDEN, l->wi, l->bi, INTERMEDIATE, inter);
-    for (int i = 0; i < tokens * INTERMEDIATE; i++) inter[i] = gelu(inter[i]);
+    parallel(tokens, gelu_rows, inter);
     linear(inter, tokens, INTERMEDIATE, l->wo2, l->bo2, HIDDEN, scratch);
     for (int i = 0; i < tokens * HIDDEN; i++) x[i] += scratch[i];
     layer_norm(x, tokens, l->ln2_w, l->ln2_b);
@@ -424,12 +590,24 @@ static long decode_json_string(char *line) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) fail("usage: embed <model-dir>/c");
+    const char *directory = NULL;
+    int threads = 1, timing = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--time")) timing = 1;
+        else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
+        else if (argv[i][0] != '-' && !directory) directory = argv[i];
+        else fail("usage: embed <model-dir>/c [--threads N] [--time]");
+    }
+    if (!directory || threads < 1 || threads > 64) fail("usage: embed <model-dir>/c [--threads N] [--time]");
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     char path[4096];
-    snprintf(path, sizeof path, "%s/weights.bin", argv[1]);
+    snprintf(path, sizeof path, "%s/weights.bin", directory);
     load_weights(path);
-    snprintf(path, sizeof path, "%s/vocab.txt", argv[1]);
+    snprintf(path, sizeof path, "%s/vocab.txt", directory);
     load_vocab(path);
+    start_pool(threads);
 
     static char line[1 << 20];
     static int ids[MAX_TOKENS];
@@ -437,8 +615,14 @@ int main(int argc, char **argv) {
     while (fgets(line, sizeof line, stdin)) {
         long length = decode_json_string(line);
         if (length < 0) { puts("{\"error\":\"expected a JSON string\"}"); fflush(stdout); continue; }
+        struct timespec started, finished;
+        clock_gettime(CLOCK_MONOTONIC, &started);
+        request_begin();
         int tokens = tokenize(line, (size_t)length, ids);
         embed(ids, tokens, vector);
+        request_end();
+        clock_gettime(CLOCK_MONOTONIC, &finished);
+        if (timing) fprintf(stderr, "%ld\n", (finished.tv_sec - started.tv_sec) * 1000000L + (finished.tv_nsec - started.tv_nsec) / 1000);
         fputs("{\"ids\":[", stdout);
         for (int t = 0; t < tokens; t++) printf(t ? ",%d" : "%d", ids[t]);
         fputs("],\"vector\":[", stdout);

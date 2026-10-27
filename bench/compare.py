@@ -4,13 +4,15 @@
 
 Builds bench/build/embed if needed, exports weights if needed, then sends the
 CLINC150 fixture sentences plus a few mixed-case and punctuated ones through
-three persistent processes: the C embedder, ONNX Runtime with default threads,
-and ONNX Runtime pinned to one thread. Load time is excluded by timing only
+four persistent processes: the C embedder on one thread and on all performance
+cores, ONNX Runtime with default threads, and ONNX Runtime pinned to one thread. Load time is excluded by timing only
 after each process answers its first request.
 """
 
 import argparse
 import json
+import os
+import platform
 import subprocess
 import sys
 import time
@@ -41,9 +43,10 @@ def prepare():
 
 
 class Runner:
-    def __init__(self, name, command):
+    def __init__(self, name, command, stderr=None):
         self.name = name
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=ROOT)
+        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=stderr, text=True, cwd=ROOT)
 
     def embed(self, text):
         self.process.stdin.write(json.dumps(text) + "\n")
@@ -58,10 +61,22 @@ class Runner:
         self.process.wait(timeout=10)
 
 
+def performance_cores():
+    """Threads beyond the performance cores land on efficiency cores and slow the whole request."""
+    if platform.system() == "Darwin":
+        try:
+            return int(subprocess.check_output(["sysctl", "-n", "hw.perflevel0.logicalcpu"], text=True))
+        except (subprocess.CalledProcessError, ValueError):
+            pass
+    return os.cpu_count() or 1
+
+
 def runners():
     python = [sys.executable, str(ROOT / "bench/embed_python.py")]
+    cores = performance_cores()
     return [
         Runner("C, one thread", [str(BINARY), str(EXPORT)]),
+        Runner(f"C, {cores} threads", [str(BINARY), str(EXPORT), "--threads", str(cores)]),
         Runner("ONNX Runtime, default threads", python),
         Runner("ONNX Runtime, one thread", python + ["--threads", "1"]),
     ]
@@ -75,7 +90,7 @@ def main():
     texts = [row["text"] for row in json.loads(FIXTURE.read_text(encoding="utf-8"))] + EXTRA
     active = runners()
     try:
-        reference = [active[1].embed(text) for text in texts]  # also absorbs load time
+        reference = [active[2].embed(text) for text in texts]  # also absorbs load time
         for runner in active:
             runner.embed(texts[0])
             worst = 0.0

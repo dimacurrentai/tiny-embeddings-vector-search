@@ -28,17 +28,23 @@ class CEmbeddingTests(unittest.TestCase):
         import compare
 
         compare.prepare()
-        c, python = compare.Runner("C", [str(compare.BINARY), str(compare.EXPORT)]), None
+        runners = []
         try:
+            c = compare.Runner("C", [str(compare.BINARY), str(compare.EXPORT)])
+            runners.append(c)
+            threaded = compare.Runner("C threaded", [str(compare.BINARY), str(compare.EXPORT), "--threads", "3"])
+            runners.append(threaded)
             python = compare.Runner("Python", [sys.executable, str(ROOT / "bench/embed_python.py")])
+            runners.append(python)
             for text in SENTENCES:
                 expected, actual = python.embed(text), c.embed(text)
                 self.assertEqual(actual["ids"], expected["ids"], text)
                 self.assertEqual(len(actual["vector"]), 384)
                 difference = max(abs(a - b) for a, b in zip(actual["vector"], expected["vector"]))
                 self.assertLess(difference, 1e-5, text)
+                # Threads split the work by column block; every element is summed in the same order.
+                self.assertEqual(threaded.embed(text), actual, text)
             self.assertEqual(len(c.embed("x " * 400)["ids"]), 256)
         finally:
-            c.close()
-            if python:
-                python.close()
+            for runner in runners:
+                runner.close()
